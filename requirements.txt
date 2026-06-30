@@ -1,7 +1,5 @@
 fal-client
 anthropic
-google-genai
-pillow
 requests
 fastapi
 uvicorn
