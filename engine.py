@@ -2,19 +2,15 @@
 """
 AUTO CLIP ENGINE  (DramaBox-style, any topic)
 
-upload script -> Haiku breaks it into shots -> Nano Banana (via fal) makes images
--> Wan 2.2 animates each -> ordered, numbered clips zipped for a video editor.
+script -> Haiku shot list -> Nano Banana images (fal) -> Wan 2.2 clips (fal)
+-> ordered numbered clips zipped for a video editor. No stitching.
 
-NO stitching. You get individual clips in order to edit manually.
-
-Stack (everything except Haiku runs through fal -> one vendor, one bill):
-  - Script director : Claude Haiku           (Anthropic API)  ANTHROPIC_API_KEY
-  - Images          : Nano Banana            (fal)            FAL_KEY
-  - Video           : Wan 2.2 image-to-video (fal)            FAL_KEY
+Stack:
+  - Script director : Claude Haiku  (Anthropic API)  ANTHROPIC_API_KEY
+  - Images + Video  : fal                            FAL_KEY
 
 Standalone:
-    python engine.py myscript.txt vertical
-    (sizes: vertical | landscape | square)
+    python engine.py myscript.txt vertical   (vertical | landscape | square)
 """
 
 import os
@@ -34,14 +30,18 @@ except ImportError:
     print("Run:  pip install fal-client anthropic requests")
     sys.exit(1)
 
-# ---- models (swap any of these later) ----
 DIRECTOR_MODEL = "claude-haiku-4-5-20251001"
-IMAGE_T2I      = "fal-ai/nano-banana"                          # text -> image
-IMAGE_EDIT     = "fal-ai/nano-banana/edit"                     # image+text -> image (keeps a character)
-VIDEO_MODEL    = "fal-ai/wan/v2.2-a14b/image-to-video/turbo"   # Wan 2.2 turbo
+IMAGE_T2I      = "fal-ai/nano-banana"
+IMAGE_EDIT     = "fal-ai/nano-banana/edit"
+VIDEO_MODEL    = "fal-ai/wan/v2.2-a14b/image-to-video/turbo"
 
 SIZES = {"vertical": "9:16", "landscape": "16:9", "square": "1:1"}
 VIDEO_RES = "720p"
+NEUTRAL_MOTION = "Slow, gentle cinematic camera movement with subtle natural motion in the scene."
+
+
+class ContentBlocked(Exception):
+    """Raised when fal's content filter rejects a prompt (no point retrying it)."""
 
 
 def log(m): print(f"  {m}", flush=True)
@@ -60,6 +60,9 @@ def fal_call(model, args, tries=3):
             return fal_client.subscribe(model, arguments=args,
                                         with_logs=True, on_queue_update=on_update)
         except Exception as e:
+            msg = str(e).lower()
+            if "content_policy" in msg or "content checker" in msg or "flagged" in msg:
+                raise ContentBlocked(str(e))   # don't waste retries on a filter block
             last = e; log(f"  retry {i}/{tries}: {e}"); time.sleep(2 * i)
     raise last
 
@@ -90,9 +93,14 @@ Return ONLY valid JSON, no markdown, no commentary. Schema:
 
 Rules:
 - One scene = one continuous visual shot. Aim for 4-8 scenes for a short script.
-- Keep the scenes in the correct narrative ORDER.
+- Keep the scenes in correct narrative ORDER.
 - Only list a character in "characters" if the SAME person should look identical across multiple shots.
-- image_prompt must be self-contained and cinematic. motion_prompt must be short and concrete."""
+- image_prompt must be self-contained and cinematic. motion_prompt must be short and concrete.
+
+CONTENT SAFETY (critical - the prompts go to an automated service with strict filters):
+- NEVER use words for graphic violence, gore, blood, wounds, killing, death, weapons striking people, or anything explicit or disturbing.
+- Convey conflict, war, battle, or danger through ATMOSPHERE only: tension, posture, soldiers in formation, distant silhouettes, smoke, dust, weather, torchlight, shadows, aftermath, and facial expressions.
+- Every image_prompt and motion_prompt must be suitable for a general audience (PG). Keep camera motion calm and cinematic; avoid words like "violent", "brutal", "fierce fighting"."""
 
 
 def direct_script(script_text):
@@ -107,31 +115,33 @@ def direct_script(script_text):
     return json.loads(raw)
 
 
-# ---------- STEP 2: images via Nano Banana (fal) ----------
+# ---------- STEP 2: images (Nano Banana via fal) ----------
 def gen_anchor(description, aspect):
     res = fal_call(IMAGE_T2I, {
         "prompt": (f"Character reference sheet, front view, plain neutral background, "
                    f"even lighting. {description}"),
         "aspect_ratio": aspect, "num_images": 1, "output_format": "png",
+        "safety_tolerance": "5",
     })
-    return res["images"][0]["url"]            # a fal-hosted URL
+    return res["images"][0]["url"]
 
 
 def gen_scene_image(image_prompt, ref_urls, aspect):
-    if ref_urls:                              # keep recurring character(s) consistent
+    if ref_urls:
         res = fal_call(IMAGE_EDIT, {
             "prompt": image_prompt, "image_urls": ref_urls,
             "aspect_ratio": aspect, "num_images": 1, "output_format": "png",
+            "safety_tolerance": "5",
         })
-    else:                                     # fresh shot, no locked character
+    else:
         res = fal_call(IMAGE_T2I, {
             "prompt": image_prompt, "aspect_ratio": aspect,
-            "num_images": 1, "output_format": "png",
+            "num_images": 1, "output_format": "png", "safety_tolerance": "5",
         })
     return res["images"][0]["url"]
 
 
-# ---------- STEP 3: Wan 2.2 (image URL goes straight in) ----------
+# ---------- STEP 3: Wan 2.2 ----------
 def gen_clip(image_url, motion_prompt, aspect):
     res = fal_call(VIDEO_MODEL, {
         "prompt": motion_prompt, "image_url": image_url,
@@ -159,32 +169,59 @@ def run(script_text, size="vertical", project="project"):
     print("[2/3] locking recurring characters...")
     anchors = {}
     for ch in plan.get("characters", []):
-        log(f"character: {ch['name']}")
-        anchors[ch["name"]] = gen_anchor(ch["description"], aspect)
+        try:
+            log(f"character: {ch['name']}")
+            anchors[ch["name"]] = gen_anchor(ch["description"], aspect)
+        except ContentBlocked:
+            log(f"  character '{ch['name']}' blocked by filter — scenes will run without a locked reference")
 
     manifest = {"title": plan.get("title"), "size": size, "clips": []}
     shotlist_lines = [f"TITLE: {plan.get('title')}   SIZE: {size}", ""]
+    skipped = []
+    produced = 0
 
     for i, sc in enumerate(scenes, 1):
-        n = f"{i:02d}"                          # 01, 02, 03 ... editor order
-        print(f"[3/3] clip {i}/{len(scenes)}  ->  {n}.mp4")
+        print(f"[3/3] scene {i}/{len(scenes)}")
         refs = [anchors[name] for name in sc.get("characters", []) if name in anchors]
 
-        log("image (Nano Banana)...")
-        img_url = gen_scene_image(sc["image_prompt"], refs, aspect)
-        download(img_url, out / "scenes" / f"{n}.png")
+        # image
+        try:
+            log("image (Nano Banana)...")
+            img_url = gen_scene_image(sc["image_prompt"], refs, aspect)
+        except ContentBlocked:
+            log("  image blocked by content filter — skipping this scene")
+            skipped.append((i, "image", sc["image_prompt"])); continue
 
-        log("clip (Wan 2.2)...")
-        clip_url = gen_clip(img_url, sc["motion_prompt"], aspect)
+        # clip (auto-soften once if the motion wording is blocked)
+        try:
+            log("clip (Wan 2.2)...")
+            clip_url = gen_clip(img_url, sc["motion_prompt"], aspect)
+        except ContentBlocked:
+            log("  motion blocked — retrying with neutral motion")
+            try:
+                clip_url = gen_clip(img_url, NEUTRAL_MOTION, aspect)
+            except ContentBlocked:
+                log("  still blocked — skipping this scene")
+                skipped.append((i, "motion", sc["motion_prompt"])); continue
+
+        produced += 1
+        n = f"{produced:02d}"
+        log(f"  -> {n}.mp4")
+        download(img_url, out / "scenes" / f"{n}.png")
         download(clip_url, out / "clips" / f"{n}.mp4")
 
         manifest["clips"].append({
-            "order": i, "file": f"{n}.mp4",
+            "order": produced, "file": f"{n}.mp4",
             "scene": sc["image_prompt"], "motion": sc["motion_prompt"],
         })
         shotlist_lines += [f"{n}.mp4",
                            f"   scene : {sc['image_prompt']}",
                            f"   motion: {sc['motion_prompt']}", ""]
+
+    if skipped:
+        shotlist_lines.append("SKIPPED by content filter:")
+        for idx, where, text in skipped:
+            shotlist_lines.append(f"   original scene {idx} [{where}]: {text}")
 
     (out / "shotlist.txt").write_text("\n".join(shotlist_lines))
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -195,7 +232,7 @@ def run(script_text, size="vertical", project="project"):
             z.write(clip, arcname=f"clips/{clip.name}")
         z.write(out / "shotlist.txt", arcname="shotlist.txt")
 
-    print(f"\nDONE. Ordered clips: {out / 'clips'}")
+    print(f"\nDONE. {produced} clips produced, {len(skipped)} skipped.")
     print(f"Handoff zip: {zip_path}")
     return zip_path
 
